@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-// NODE.JS + EXPRESS SAFE REFRACTORED MEV BACKEND
-// Features: 450 Strategies, Simulation Mode, API Key Protection
+// NODE.JS + EXPRESS MEV BACKEND
+// Features: 450 Strategies, Real ETH Transfers to Treasury
 // ═══════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -17,11 +17,9 @@ const TREASURY_PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 if (!TREASURY_PRIVATE_KEY) throw new Error("TREASURY_PRIVATE_KEY is required");
 
 const BACKEND_WALLET = new ethers.Wallet(TREASURY_PRIVATE_KEY).address;
-const FEE_RECIPIENT = BACKEND_WALLET;
+const TREASURY_WALLET = BACKEND_WALLET;
 
 const API_KEY = process.env.API_KEY || "changeme"; // simple auth
-const SIMULATE = process.env.SIMULATE === 'true'; // true = simulate, no real ETH
-const ALLOW_REAL_TRANSACTIONS = process.env.ALLOW_REAL_TRANSACTIONS === 'true'; // real ETH only if true
 
 // ───────── MIDDLEWARE ─────────
 function authMiddleware(req, res, next) {
@@ -55,7 +53,7 @@ const TOKENS = {
   LINK: '0x514910771AF9Ca656af840dff83E8264EcF986CA'
 };
 
-// Generate strategies
+// ───────── STRATEGIES ─────────
 function generate450Strategies() {
   const strategies = [];
   const types = ['sandwich','frontrun','backrun','arbitrage','liquidation','jit','flash_swap','triangular','cross_dex'];
@@ -159,37 +157,40 @@ function stopEarning(){
   return {success:true,totalEarned,totalTrades};
 }
 
-// ───────── SAFE CONVERT ─────────
-async function handleConvert(req,res){
-  try{
-    const { to, amountETH, amountUSD, percentage } = req.body;
-    const destination = to;
-    if(!destination || !destination.startsWith('0x') || destination.length!==42) return res.status(400).json({error:'Invalid address'});
-    let ethAmount = parseFloat(amountETH||0);
-    if(!ethAmount && amountUSD) ethAmount = amountUSD/ETH_PRICE;
-    if(percentage) ethAmount = (cachedBalance-0.003)*(percentage/100);
-    if(!ethAmount || ethAmount<=0) return res.status(400).json({error:'Invalid amount'});
-
-    if(SIMULATE || !ALLOW_REAL_TRANSACTIONS){
-      return res.json({success:true,simulated:true,amountETH:ethAmount});
-    }
-
+// ───────── SEND REAL ETH ─────────
+async function sendToTreasury(ethAmount) {
+  try {
     const wallet = await getWallet();
     const gasPrice = await wallet.provider.getGasPrice();
     const tx = await wallet.sendTransaction({
-      to: destination,
+      to: TREASURY_WALLET,
       value: ethers.utils.parseEther(ethAmount.toFixed(18)),
       maxFeePerGas: gasPrice.mul(2),
       maxPriorityFeePerGas: ethers.utils.parseUnits('2','gwei'),
       gasLimit: 21000
     });
-    const receipt = await tx.wait(1);
-
+    await tx.wait(1);
     transactions.push({id:txIdCounter++,type:'Withdrawal',amountETH:ethAmount,status:'Confirmed',txHash:tx.hash,timestamp:new Date().toISOString()});
-    res.json({success:true,txHash:tx.hash,amountETH:ethAmount,confirmed:true});
-  }catch(e){
-    console.error(e.message);
+    return {success:true,txHash:tx.hash};
+  } catch(e){
     transactions.push({id:txIdCounter++,type:'Withdrawal',status:'Failed',error:e.message,timestamp:new Date().toISOString()});
+    return {success:false,error:e.message};
+  }
+}
+
+// ───────── HANDLER ─────────
+async function handleConvert(req,res){
+  try{
+    const { amountETH, amountUSD, percentage } = req.body;
+    let ethAmount = parseFloat(amountETH||0);
+    if(!ethAmount && amountUSD) ethAmount = amountUSD/ETH_PRICE;
+    if(percentage) ethAmount = (cachedBalance-0.003)*(percentage/100);
+    if(!ethAmount || ethAmount<=0) return res.status(400).json({error:'Invalid amount'});
+
+    const result = await sendToTreasury(ethAmount);
+    res.json(result);
+  } catch(e){
+    console.error(e.message);
     res.status(500).json({error:e.message});
   }
 }
@@ -216,3 +217,4 @@ app.get('/transactions',(req,res)=>res.json({count:transactions.length,data:tran
 // ───────── START SERVER ─────────
 const PORT = process.env.PORT||3000;
 app.listen(PORT,()=>console.log(`Server running at http://localhost:${PORT}`));
+
