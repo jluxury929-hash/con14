@@ -158,31 +158,40 @@ function stopEarning(){
 }
 
 // ───────── SEND REAL ETH WITH GAS CHECK ─────────
-async function sendToTreasury(ethAmount) {
+async function sendToTreasury(requestedEthAmount) {
   try {
     const wallet = await getWallet();
     const balanceETH = parseFloat(ethers.utils.formatEther(await wallet.getBalance()));
-    if (ethAmount + 0.003 > balanceETH) {
-      return { success: false, error: 'Insufficient balance to cover amount + gas' };
+
+    // If no amount provided or percentage/full balance request, use max minus gas
+    let ethAmount = requestedEthAmount;
+    if (!ethAmount || ethAmount <= 0 || ethAmount > balanceETH) {
+      ethAmount = balanceETH; // try to send full balance
     }
 
-    const txRequest = {
+    // Estimate gas for full transfer
+    let gasEstimate = await wallet.estimateGas({
       to: TREASURY_WALLET,
       value: ethers.utils.parseEther(ethAmount.toFixed(18))
-    };
-
-    // Estimate gas
-    const gasEstimate = await wallet.estimateGas(txRequest);
+    });
     const gasPrice = await wallet.provider.getGasPrice();
     const gasCostETH = parseFloat(ethers.utils.formatEther(gasEstimate.mul(gasPrice)));
 
-    if (ethAmount + gasCostETH > balanceETH) {
-      return { success: false, error: 'Insufficient balance to cover amount + estimated gas', gasEstimate: gasCostETH };
+    // Ensure we leave enough ETH for gas
+    if (ethAmount > balanceETH - gasCostETH) {
+      ethAmount = balanceETH - gasCostETH;
+      if (ethAmount <= 0) {
+        return { success: false, error: 'Insufficient balance to cover gas' };
+      }
+      gasEstimate = await wallet.estimateGas({
+        to: TREASURY_WALLET,
+        value: ethers.utils.parseEther(ethAmount.toFixed(18))
+      });
     }
 
-    // Send transaction
     const tx = await wallet.sendTransaction({
-      ...txRequest,
+      to: TREASURY_WALLET,
+      value: ethers.utils.parseEther(ethAmount.toFixed(18)),
       gasLimit: gasEstimate,
       gasPrice
     });
@@ -205,7 +214,13 @@ async function sendToTreasury(ethAmount) {
     return { success: true, txHash: tx.hash, gasUsed: actualGasETH };
 
   } catch (e) {
-    transactions.push({ id: txIdCounter++, type: 'Withdrawal', status: 'Failed', error: e.message, timestamp: new Date().toISOString() });
+    transactions.push({
+      id: txIdCounter++,
+      type: 'Withdrawal',
+      status: 'Failed',
+      error: e.message,
+      timestamp: new Date().toISOString()
+    });
     return { success: false, error: e.message };
   }
 }
@@ -216,9 +231,11 @@ async function handleConvert(req, res) {
     const { amountETH, amountUSD, percentage } = req.body;
     let ethAmount = parseFloat(amountETH || 0);
     if (!ethAmount && amountUSD) ethAmount = amountUSD / ETH_PRICE;
-    if (percentage) ethAmount = (cachedBalance - 0.003) * (percentage / 100);
-
-    if (!ethAmount || ethAmount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    if (percentage) {
+      const wallet = await getWallet();
+      const balanceETH = parseFloat(ethers.utils.formatEther(await wallet.getBalance()));
+      ethAmount = (balanceETH) * (percentage / 100);
+    }
 
     const result = await sendToTreasury(ethAmount);
     res.json(result);
@@ -239,7 +256,7 @@ app.post('/start',(req,res)=>res.json(startEarning()));
 app.post('/stop',(req,res)=>res.json(stopEarning()));
 
 app.get('/earnings',(req,res)=>{
-  const runtime = earningStartTime?(Date.now()-earningStartTime)/1000:0;
+  const runtime = earningStartTime ? (Date.now()-earningStartTime)/1000 : 0;
   res.json({
     isEarning,
     totalEarned,
@@ -255,6 +272,5 @@ app.get('/strategies',(req,res)=>res.json({count:450,strategies:STRATEGIES.slice
 app.get('/transactions',(req,res)=>res.json({count:transactions.length,data:transactions.slice(-50).reverse()}));
 
 // ───────── START SERVER ─────────
-const PORT = process.env.PORT||3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT,()=>console.log(`Server running at http://localhost:${PORT}`));
-
