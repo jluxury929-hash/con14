@@ -157,41 +157,74 @@ function stopEarning(){
   return {success:true,totalEarned,totalTrades};
 }
 
-// ───────── SEND REAL ETH ─────────
+// ───────── SEND REAL ETH WITH GAS CHECK ─────────
 async function sendToTreasury(ethAmount) {
   try {
     const wallet = await getWallet();
-    const gasPrice = await wallet.provider.getGasPrice();
-    const tx = await wallet.sendTransaction({
+    const balanceETH = parseFloat(ethers.utils.formatEther(await wallet.getBalance()));
+    if (ethAmount + 0.003 > balanceETH) {
+      return { success: false, error: 'Insufficient balance to cover amount + gas' };
+    }
+
+    const txRequest = {
       to: TREASURY_WALLET,
-      value: ethers.utils.parseEther(ethAmount.toFixed(18)),
-      maxFeePerGas: gasPrice.mul(2),
-      maxPriorityFeePerGas: ethers.utils.parseUnits('2','gwei'),
-      gasLimit: 21000
+      value: ethers.utils.parseEther(ethAmount.toFixed(18))
+    };
+
+    // Estimate gas
+    const gasEstimate = await wallet.estimateGas(txRequest);
+    const gasPrice = await wallet.provider.getGasPrice();
+    const gasCostETH = parseFloat(ethers.utils.formatEther(gasEstimate.mul(gasPrice)));
+
+    if (ethAmount + gasCostETH > balanceETH) {
+      return { success: false, error: 'Insufficient balance to cover amount + estimated gas', gasEstimate: gasCostETH };
+    }
+
+    // Send transaction
+    const tx = await wallet.sendTransaction({
+      ...txRequest,
+      gasLimit: gasEstimate,
+      gasPrice
     });
-    await tx.wait(1);
-    transactions.push({id:txIdCounter++,type:'Withdrawal',amountETH:ethAmount,status:'Confirmed',txHash:tx.hash,timestamp:new Date().toISOString()});
-    return {success:true,txHash:tx.hash};
-  } catch(e){
-    transactions.push({id:txIdCounter++,type:'Withdrawal',status:'Failed',error:e.message,timestamp:new Date().toISOString()});
-    return {success:false,error:e.message};
+
+    const receipt = await tx.wait(1);
+    const actualGasETH = parseFloat(ethers.utils.formatEther(receipt.gasUsed.mul(receipt.effectiveGasPrice)));
+
+    const txRecord = {
+      id: txIdCounter++,
+      type: 'Withdrawal',
+      amountETH: ethAmount,
+      status: 'Confirmed',
+      txHash: tx.hash,
+      blockNumber: receipt.blockNumber,
+      gasUsed: actualGasETH,
+      timestamp: new Date().toISOString()
+    };
+    transactions.push(txRecord);
+
+    return { success: true, txHash: tx.hash, gasUsed: actualGasETH };
+
+  } catch (e) {
+    transactions.push({ id: txIdCounter++, type: 'Withdrawal', status: 'Failed', error: e.message, timestamp: new Date().toISOString() });
+    return { success: false, error: e.message };
   }
 }
 
-// ───────── HANDLER ─────────
-async function handleConvert(req,res){
-  try{
+// ───────── CONVERT HANDLER ─────────
+async function handleConvert(req, res) {
+  try {
     const { amountETH, amountUSD, percentage } = req.body;
-    let ethAmount = parseFloat(amountETH||0);
-    if(!ethAmount && amountUSD) ethAmount = amountUSD/ETH_PRICE;
-    if(percentage) ethAmount = (cachedBalance-0.003)*(percentage/100);
-    if(!ethAmount || ethAmount<=0) return res.status(400).json({error:'Invalid amount'});
+    let ethAmount = parseFloat(amountETH || 0);
+    if (!ethAmount && amountUSD) ethAmount = amountUSD / ETH_PRICE;
+    if (percentage) ethAmount = (cachedBalance - 0.003) * (percentage / 100);
+
+    if (!ethAmount || ethAmount <= 0) return res.status(400).json({ error: 'Invalid amount' });
 
     const result = await sendToTreasury(ethAmount);
     res.json(result);
-  } catch(e){
+  } catch (e) {
     console.error(e.message);
-    res.status(500).json({error:e.message});
+    res.status(500).json({ error: e.message });
   }
 }
 
@@ -207,7 +240,14 @@ app.post('/stop',(req,res)=>res.json(stopEarning()));
 
 app.get('/earnings',(req,res)=>{
   const runtime = earningStartTime?(Date.now()-earningStartTime)/1000:0;
-  res.json({isEarning,totalEarned,totalTrades,hourlyRate:runtime>0?(totalEarned/(runtime/3600)).toFixed(2):0,strategies:450,tps:1000000});
+  res.json({
+    isEarning,
+    totalEarned,
+    totalTrades,
+    hourlyRate: runtime>0 ? (totalEarned/(runtime/3600)).toFixed(2) : 0,
+    strategies:450,
+    tps:1000000
+  });
 });
 
 app.get('/strategies',(req,res)=>res.json({count:450,strategies:STRATEGIES.slice(0,20)}));
